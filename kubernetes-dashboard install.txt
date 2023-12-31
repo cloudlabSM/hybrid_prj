@@ -1,0 +1,71 @@
+kubernetes-dashboard 설치
+
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/dashboard/v2.6.1/aio/deploy/recommended.yaml
+
+kubectl -n kubernetes-dashboard edit svc kubernetes-dashboard
+==========================
+  - IPv4
+  ipFamilyPolicy: SingleStack
+  ports:
+  - nodePort: 32613
+    port: 443
+    protocol: TCP
+    targetPort: 8443
+  selector:
+    k8s-app: kubernetes-dashboard
+  sessionAffinity: None
+  type: LoadBalancer   # 기존에 ClusterIP를 LoadBalancer 로 수정
+===========================
+
+# External IP 확인
+kubectl -n kubernetes-dashboard get svc kubernetes-dashboard 
+
+
+# admin 사용자 생성, 권한부여 및 클러스터 롤, 시크릿 설정
+vi dash_auth.yaml
+
+=================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: admin-user
+  namespace: kubernetes-dashboard
+
+---
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: admin-user
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: admin-user
+  namespace: kubernetes-dashboard
+
+---
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: admin-user
+  namespace: kubernetes-dashboard
+  annotations:
+    kubernetes.io/service-account.name: "admin-user"
+type: kubernetes.io/service-account-token
+================================
+
+kubectl apply -f dash_auth.yaml
+
+kubectl -n kubernetes-dashboard create token admin-user >> token.txt
+
+# 토큰 값 복사 
+cat token.txt
+
+# untangle 에 포트포워딩
+-노트북 브라우저에서 접속하도록...
+
+

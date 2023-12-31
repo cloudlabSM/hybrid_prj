@@ -1,0 +1,116 @@
+metallb 설치   2023.09.22
+
+kubectl edit configmap -n kube-system kube-proxy
+========================
+    ipvs:
+      excludeCIDRs: null
+      minSyncPeriod: 0s
+      scheduler: ""
+      strictARP: true    # -> false 를 true 로 수정
+      syncPeriod: 0s
+      tcpFinTimeout: 0s
+      tcpTimeout: 0s
+      udpTimeout: 0s
+=========================
+
+kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.13.11/config/manifests/metallb-native.yaml
+
+kubectl get po -n metallb-system
+
+
+vi ip_pool.yaml
+============================
+# 고정적으로 쓸 ip 범위 설정
+
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: first-pool
+  namespace: metallb-system
+spec:
+  addresses:
+  - 10.0.0.50-10.0.0.55
+
+#---
+# 풀을 여러개 만들수도 있음 
+
+# apiVersion: metallb.io/v1beta1
+#kind: IPAddressPool
+#metadata:
+#  name: second-pool
+#  namespace: metallb-system
+#spec:
+#  addresses:
+#  - 10.0.0.60-10.0.0.69
+
+---
+
+# L2네트워크 생성
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: my-network-l2
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+  - first-pool
+#  - second-pool
+
+===============================
+
+# 위에서 ip 범위는 internal cidr 10.0.0.0/24 에서 남아있는 ip 여야함 
+
+kubectl apply -f ip_pool.yaml
+
+
+# test 할 svc 생성해보자!
+vi my-example.yaml 
+===================================
+apiVersion: v1
+kind: Pod
+metadata:
+  name: almighty
+  labels:
+    app: almighty
+spec:
+  terminationGracePeriodSeconds: 3
+  containers:
+  - name: almighty
+    image: docker.io/andrewloyolajeong/almighty:0.2.4
+ 
+---
+ 
+apiVersion: v1
+kind: Service
+metadata:
+  name: almighty
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    app: almighty
+  ports:
+    - name: myweb
+      protocol: TCP
+      port: 8080
+      targetPort: 8080
+    - name: yourweb
+      protocol: TCP
+      port: 80
+      targetPort: 80
+================================
+
+kubectl create ns ns1
+
+kubectl apply -n ns1 -f my-example.yaml
+
+kubectl get -n ns1 svc
+
+# svc 조회 결과
+[root@master1 ~]# kubectl get svc -n ns1
+NAME       TYPE           CLUSTER-IP     EXTERNAL-IP   PORT(S)                       AGE
+almighty   LoadBalancer   10.98.156.85   10.0.0.50     8080:32442/TCP,80:32349/TCP   91m
+
+
+이제 untangle vm 의 웹브라우저에서 10.0.0.50 으로 접속 확인
+그러고 untangle에서 10.0.0.50:80 으로 포트포워딩 추가하고 노트북 웹 브라우저에서 172.16.1.36 으로 접속확인

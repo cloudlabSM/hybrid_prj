@@ -1,0 +1,379 @@
+multi master cluster 구축 
+
+ 참고 사이트: 
+
+https://wiki.tistory.com/entry/Hyper-V-%EC%97%90-VM%EC%9D%84-%EB%A7%8C%EB%93%A4%EC%96%B4-kubernetes-%ED%81%B4%EB%9F%AC%EC%8A%A4%ED%84%B0-%EA%B5%AC%EC%84%B1%ED%95%98%EA%B8%B0
+
+https://velog.io/@pingping95/Kubernetes-kubeadm-Master-%EA%B3%A0%EA%B0%80%EC%9A%A9%EC%84%B1
+
+# hostname 세팅
+
+vi /etc/hosts
+---------------------------------------
+127.0.0.1   localhost localhost.localdomain localhost4 localhost4.localdomain4
+::1         localhost localhost.localdomain localhost6 localhost6.localdomain6
+10.0.0.101 master1 k8s-ma1
+10.0.0.102 master2 k8s-ma2
+10.0.0.103 master3 k8s-ma3
+10.0.0.104 worker1 k8s-wor1
+10.0.0.105 worker2 k8s-wor2
+10.0.0.106 worker3 k8s-wor3
+----------------------------------------
+
+   hostnamectl set-hostname <hostname>
+   sudo -i
+
+# ansible 사용 세팅하기 
+
+    1  yum install epel-release -y
+    2  yum install ansible wget -y
+    3  vi /etc/ansible/hosts 
+============================================
+(생략~~)
+맨 하단에 아래 [master] , [all:vars] 추가
+# Here's another example of host ranges, this time there are no
+# leading 0s:
+
+## db-[99:101]-node.example.com
+
+[master]
+master1
+master2
+master3
+worker1
+worker2
+worker3
+
+[all:vars]
+ansible_user=root
+ansible_connection=ssh
+ansible_port=22
+============================================
+
+ 
+
+    ssh-keygen -t rsa
+     ssh-copy-id master1
+     ssh-copy-id master2
+     ssh-copy-id master3
+     ssh-copy-id worker1
+     ssh-copy-id worker2
+     ansible -m copy -a "src=/etc/ansible/hosts dest=/etc/ansible/hosts" all
+
+# docker 설치
+    ansible all -m shell -a "yum install -y yum-utils"
+    ansible all -m shell -a "yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo"
+    ansible all -m shell -a "yum install -y docker-ce docker-ce-cli containerd.io"
+
+   ansible all -m shell -a "systemctl start docker"
+   ansible all -m shell -a "systemctl enable docker"
+   docker ps
+
+# k8s 설치 전 selinux, 방화벽 설정
+   ansible all -m shell -a "systemctl stop firewalld"
+   ansible all -m shell -a "systemctl disable firewalld"
+    ansible all -m shell -a "swapoff -a && sed -i '/swap/s/^/#/' /etc/fstab"
+   ansible all -m shell -a "setenforce  0 "
+
+# iptable 설정 (pod 끼리 통신 가능하게 하기 위함)
+   ansible all -m shell -a "modprobe br_netfilter"
+   ansible all -m shell -a "modprobe overlay"
+   
+# master1, 2, 3 worker 1,2 수동 세팅
+    cat <<EOF >  /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-ip6tables = 1
+net.bridge.bridge-nf-call-iptables = 1
+net.ipv4.ip_forward = 1
+EOF
+
+    ansible all -m shell -a "sysctl --system"
+
+    ansible all -m shell -a "sed -i  s/SELINUX=enforcing/SELINUX=permissive/ /etc/selinux/config"
+
+# SELinux 해제, SWAP 끄기
+   ansible all -m shell -a "setenforce 0"
+
+   ansible all -m shell -a "swapoff -a"
+   ansible all -m shell -a "sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab"
+
+# k8s repo 추가
+# master1, 2, 3 worker 1,2 수동 세팅
+
+    cat <<EOF > /etc/yum.repos.d/kubernetes.repo
+[kubernetes]
+name=Kubernetes
+baseurl=https://packages.cloud.google.com/yum/repos/kubernetes-el7-x86_64
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://packages.cloud.google.com/yum/doc/yum-key.gpg https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
+EOF
+
+# kubelet, kubeadm, kubectl 설치
+  ansible all -m shell -a "yum install -y kubelet kubeadm kubectl --disableexcludes=kubernetes"
+   ansible all -m shell -a "systemctl enable --now kubelet"
+
+# cgroup systemd 로 맞춰주기
+
+   docker info | grep Cgroup -F2
+
+
+   cat <<EOF | sudo tee /etc/docker/daemon.json
+{
+  "exec-opts": ["native.cgroupdriver=systemd"],
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m"
+  },
+  "storage-driver": "overlay2"
+}
+EOF
+
+   ansible all -m shell -a "systemctl enable docker"
+   ansible all -m shell -a "systemctl daemon-reload"
+   ansible all -m shell -a "systemctl restart docker"
+  
+# master1 에 haproxy 설치 및 설정
+
+  yum -y install haproxy
+
+# SELinux 보안 정책과 충돌방지 위해 haproxy가 생성한 포트를 모두 허용하도록 설정 변경
+   setsebool -P haproxy_connect_any 1
+
+   vi /etc/haproxy/haproxy.cfg 
+===============================================
+
+global
+    log         127.0.0.1 local2
+
+    chroot      /var/lib/haproxy
+    pidfile     /var/run/haproxy.pid
+    maxconn     4000
+    user        haproxy
+    group       haproxy
+    daemon
+    stats socket /var/lib/haproxy/stats
+
+#---------------------------------------------------------------------
+# common defaults that all the 'listen' and 'backend' sections will
+# use if not designated in their block
+#---------------------------------------------------------------------
+defaults
+    log global
+    option  httplog
+    option  dontlognull
+    timeout connect 5000
+    timeout client 50000
+    timeout server 50000
+
+#---------------------------------------------------------------------
+# main frontend which proxys to the backends
+#---------------------------------------------------------------------
+frontend  main *:26443
+    option tcplog
+    default_backend kube-master-nodes
+
+#---------------------------------------------------------------------
+# static backend for serving up images, stylesheets and such
+#---------------------------------------------------------------------
+backend static
+    balance     roundrobin
+    server      static 127.0.0.1:4331 check
+
+#---------------------------------------------------------------------
+# round robin balancing between the various backends
+#---------------------------------------------------------------------
+backend kube-master-nodes
+    mode    tcp
+    option  tcplog
+    option  tcp-check
+    balance roundrobin
+    default-server inter 10s downinter 5s rise 2 fall 2 slowstart 60s maxconn 250 maxqueue 256 weight 100
+    server  master1 10.0.0.101:6443 check
+    server  master2 10.0.0.102:6443 check
+    server  master3 10.0.0.103:6443 check
+
+#---------------------------------------------------------------------
+# stats frontend
+#---------------------------------------------------------------------
+listen stats
+    bind *:10000
+    mode http
+    timeout client 5000
+    timeout connect 4000
+    timeout server 30000
+    #stats enable
+    stats uri /
+    #stats refresh 10s
+    stats realm Kube-api-server haproxy statistics
+    stats auth admin:admin
+    stats admin if TRUE
+=====================================================
+    systemctl restart haproxy && systemctl enable haproxy
+   systemctl status haproxy
+   ss -nltp
+
+
+# master 클러스터링 할때 자꾸 image pull error 나길래 로컬에 먼저 필요한거 다운받음 
+
+for image in registry.k8s.io/kube-apiserver:v1.28.2 \
+  registry.k8s.io/kube-controller-manager:v1.28.2 \
+  registry.k8s.io/kube-scheduler:v1.28.2 \
+  registry.k8s.io/kube-proxy:v1.28.2 \
+  registry.k8s.io/pause:3.9 \
+  registry.k8s.io/etcd:3.5.9-0 \
+  registry.k8s.io/coredns/coredns:v1.10.1; do
+sudo docker pull $image;
+done
+
+# Clustering 작업 
+
+     vi /etc/containerd/config.toml
+
+disabled_pulgins = ["cri"] 를 아래 내용으로 수정
+
+enabled_plugins = ["cri"]
+[plugins."io.containerd.grpc.v1.cri".containerd]
+  endpoint = "unix:///var/run/containerd/containerd.sock" 
+
+이 작업 매우 중요함 - kubeadm init 오류 주범
+master1,2,3 worker1,2 모두 적용해야함
+
+
+==============================================
+My /etc/containerd/config.toml file :
+
+root@ubuntu:/etc# cat /etc/containerd/config.toml
+#   Copyright 2018-2022 Docker Inc.
+
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+
+#       http://www.apache.org/licenses/LICENSE-2.0
+
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+
+enabled_plugins = ["cri"]
+[plugins."io.containerd.grpc.v1.cri".containerd]
+  endpoint = "unix:///var/run/containerd/containerd.sock"
+
+
+#root = "/var/lib/containerd"
+#state = "/run/containerd"
+#subreaper = true
+#oom_score = 0
+
+#[grpc]
+#  address = "/run/containerd/containerd.sock"
+#  uid = 0
+#  gid = 0
+
+#[debug]
+#  address = "/run/containerd/debug.sock"
+#  uid = 0
+#  gid = 0
+#  level = "info"
+===============================================
+   systemctl restart containerd
+
+#  Master 1에서 작업 -> 컨트롤플레인의 단일 진입점이 haproxy 임을 지정하는 작업
+   kubeadm init --control-plane-endpoint <master1 ip:26443> 3.0.0.21:26443 --upload-certs --pod-network-cidr=192.168.0.0/16 --ignore-preflight-errors=all >> result.txt
+
+
+#    kubeadm init --control-plane-endpoint 10.0.0.101:26443 --upload-certs --pod-network-cidr=192.168.0.0/16 --ignore-preflight-errors=all >> result.txt  
+# 조사해보니 10.244.0.0/16 이건 cni 가  flannel  일 때 권장하는 ip 라는데.. 임의로 쓰면 되나봄  나는 cni 로 weave 씀
+  
+init 명령을 통해 master node를 구성할 수 있다. init 명령에 대한 인자는 아래와 같다.
+
+--pod-network-cidr    :    Pod에서 사용할 네트워크의 대역. 각 서버의 네트워크 대역과 중복되지 않게 주의
+--apiserver-advertise-address    :    다른 노드가 마스터에 조인할 수 있는 IP 주소를 설정
+--control-plane-endpoint    :    고가용성을 위해 다중 마스터 노드를 구성할 때 공유 엔드포인트 설정
+--kubernetes-version    :    특정 버전의 쿠버네티스를 설치하기 위한 인자
+
+ 
+   cat result.txt 
+===============================================
+Your Kubernetes control-plane has initialized successfully!
+
+To start using your cluster, you need to run the following as a regular user:
+
+  mkdir -p $HOME/.kube
+  sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+  sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+Alternatively, if you are the root user, you can run:
+
+  export KUBECONFIG=/etc/kubernetes/admin.conf
+
+You should now deploy a pod network to the cluster.
+Run "kubectl apply -f [podnetwork].yaml" with one of the options listed at:
+  https://kubernetes.io/docs/concepts/cluster-administration/addons/
+
+You can now join any number of the control-plane node running the following command on each as root:
+
+  kubeadm join 10.0.0.101:26443 --token 4b0tnq.xf02uyxsztl0lyk1 \
+	--discovery-token-ca-cert-hash sha256:4055c33bf6a4d99cfd4f8a5fb593a5fbe473a851374dcf1e930a5d53e2791a2e \
+	--control-plane --certificate-key b5bfa73c3384393e19def07e7299c83cab3d9d8557dbcf1aec92ef62ba639955
+
+Please note that the certificate-key gives access to cluster sensitive data, keep it secret!
+As a safeguard, uploaded-certs will be deleted in two hours; If necessary, you can use
+"kubeadm init phase upload-certs --upload-certs" to reload certs afterward.
+
+Then you can join any number of worker nodes by running the following on each as root:
+
+kubeadm join 10.0.0.101:26443 --token 4b0tnq.xf02uyxsztl0lyk1 \
+	--discovery-token-ca-cert-hash sha256:4055c33bf6a4d99cfd4f8a5fb593a5fbe473a851374dcf1e930a5d53e2791a2e 
+====================================================
+
+# kubectl 명령어 사용 설정
+
+   mkdir -p $HOME/.kube
+   cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+   chown $(id -u):$(id -g) $HOME/.kube/config
+
+# master2, 3에서 수행
+
+kubeadm join 3.0.0.21:26443 --token 4b0tnq.xf02uyxsztl0lyk1 \
+	--discovery-token-ca-cert-hash sha256:4055c33bf6a4d99cfd4f8a5fb593a5fbe473a851374dcf1e930a5d53e2791a2e 
+
+# node 확인,  cni 설치 전에는 notready 뜨는게 정상
+   kubectl get nodes
+
+
+# cni 설치
+   kubectl apply -f https://github.com/weaveworks/weave/releases/download/v2.8.1/weave-daemonset-k8s.yaml
+
+   kubectl get nodes  -> 이제 master1,2,3 ready 떠야함
+
+
+# worker1,2에서 수행 master와 join  
+
+# result.txt 의 마지막 join 부분 복사해서 work1,2 에 join 하기 
+
+kubeadm join 10.0.0.101:26443 --token 4b0tnq.xf02uyxsztl0lyk1 \
+	--discovery-token-ca-cert-hash sha256:4055c33bf6a4d99cfd4f8a5fb593a5fbe473a851374dcf1e930a5d53e2791a2e 
+
+# 최종 결과
+[root@master1 ~]# kubectl get nodes
+NAME      STATUS   ROLES           AGE   VERSION
+master1   Ready    control-plane   75m   v1.28.2
+master2   Ready    control-plane   71m   v1.28.2
+master3   Ready    control-plane   68m   v1.28.2
+worker1   Ready    <none>          32m   v1.28.2
+worker2   Ready    <none>          32m   v1.28.2
+
+
+# kubectl 자동명령어 실행 스크립트 
+source <(kubectl completion bash)
+echo "source <(kubectl completion bash)" >>~/.bashrc
+
+
+# work 에서도 kubectl 사용 가능하게 하는 방법
+mkdir -p $HOME/.kube
+scp master1:/etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
